@@ -94,10 +94,7 @@ for filename in os.listdir(directory):
        images.append(modify_image(file_path))
         
 
-#%%
-
-# Let's say you have a list of NumPy arrays (images)
-# images = [claheImage_denoised, denoised_uint8, denoised_tv]  # replace these with your actual image arrays
+#%% Making images all uniform uint8 and RGB
 
 processed_images = []
 for img in images:
@@ -114,8 +111,7 @@ for img in images:
         img = np.concatenate([img] * 3, axis=2)
 
     processed_images.append(img)
-
-# Save to GIF
+#%% Save to GIF
 # Convert NumPy arrays to PIL images
 pil_images = [Image.fromarray(img) for img in processed_images]
 
@@ -128,6 +124,3 @@ pil_images[0].save(
     loop=0
 )
 
-#%%
-
-#%%
