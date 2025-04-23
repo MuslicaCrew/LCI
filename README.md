@@ -6,7 +6,7 @@ NOT meant to be used professionally, this is only a student project.
 # Notes
 Noice cancellation is done after applying CLAHE, and the noise cancelled image is also getting a CLAHE applied to it. This seems to have the best clarity.  
 
-<img src="CDNC.gif" width="200" height="200">
+<img src="CDNC.gif" width="300" height="300">
 
 This image shows the result for one set of CT images.  
 
