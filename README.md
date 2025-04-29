@@ -26,8 +26,8 @@ Mask used on original (CLAHE already applied) image:
 
 # ToDos
 - [x] Decide on noise cancellation (use before or after CLAHE)
-- [ ] Create a mask of the lungs
-- [ ] Binarification
+- [x] Create a mask of the lungs
+- [x] Binarification
 - [ ] Morphology
 - [ ] Edge detection
 - [ ] Create a Neural Network
