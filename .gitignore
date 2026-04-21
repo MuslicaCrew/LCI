@@ -1,5 +1,6 @@
- archive
- .idea
- .venv
+archive/*
+.idea/*
+.venv/*
 plotting-of-seg-map.ipynb
 best_model.pth
+__pycache__/

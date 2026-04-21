@@ -7,7 +7,7 @@ from PIL import Image
 import nibabel as nib
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from utils import modify_image, plot, hu_units
+from archive.utils import modify_image, plot, hu_units
 #%%
 file = "D:\\Szakdoga\\SortedPictures\\3\\1-15.dcm"
 
