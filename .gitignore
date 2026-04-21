@@ -1,0 +1,5 @@
+ archive
+ .idea
+ .venv
+plotting-of-seg-map.ipynb
+best_model.pth
