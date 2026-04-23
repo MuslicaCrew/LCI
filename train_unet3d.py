@@ -1,6 +1,10 @@
+import argparse
+import glob
+import os
+
+import pandas as pd
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.metrics import (
@@ -27,35 +31,47 @@ class NodulePatchDataset(Dataset):
     Synthetic data is generated here so you can run the script immediately and
     verify the pipeline before swapping in real data.
     """
-    def __init__(self, num_samples=100, patch_size=64):
-        self.num_samples = num_samples
+    def __init__(self, patch_size, data_dir, candidates, annotations, val_fold=0, is_val=False):
         self.patch_size  = patch_size
+
+        self.candidates = pd.read_csv(candidates)
+        self.annotations = pd.read_csv(annotations)
+        self.num_samples = len(candidates)
+
+        # Only grab scans from the relevant subsets
+        all_subsets = [f"subset{i}" for i in range(10)]
+
+        if is_val:
+            active_subsets = [f"subset{val_fold}"]
+        else:
+            active_subsets = [s for s in all_subsets if s != f"subset{val_fold}"]
+
+        # Only glob the active subsets
+        mhd_files = []
+        for subset in active_subsets:
+            mhd_files += glob.glob(os.path.join(data_dir, subset, "*.mhd"))
+
+        self.uid_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in mhd_files}
+
+        # Filter candidates to only those in active subsets
+        self.candidates = self.candidates[
+            self.candidates['seriesuid'].isin(self.uid_to_path.keys())
+        ]
 
     def __len__(self):
         return self.num_samples
 
     def __getitem__(self, idx):
-        ps = self.patch_size
-
-        # ── Replace from here with real loading (e.g. np.load, SimpleITK, etc.) ──
-        has_nodule = float(idx % 2 == 0)          # alternating labels for demo
-
-        patch = torch.randn(1, ps, ps, ps)         # (1, 64, 64, 64)
-
-        seg_mask = torch.zeros(1, ps, ps, ps)
-        if has_nodule:
-            # Place a small sphere in the centre as a fake nodule mask
-            c = ps // 2
-            for z in range(c - 6, c + 6):
-                for y in range(c - 6, c + 6):
-                    for x in range(c - 6, c + 6):
-                        if (z-c)**2 + (y-c)**2 + (x-c)**2 < 36:
-                            seg_mask[0, z, y, x] = 1.0
-
-        cls_label = torch.tensor([has_nodule], dtype=torch.float32)
-        # ── Replace until here ──
-
-        return patch, seg_mask, cls_label
+        pass
+        #img_path = os.path.join(self.img_dir, self.img_labels.iloc[idx, 0])
+        #image = decode_image(img_path)
+        #label = self.img_labels. [idx, 1]
+        #if self.transform:
+            #image = self.transform(image)
+        #if self.target_transform:
+            #label = self.target_transform(label)
+        #return image, label
+        #numpy_image, numpy_origin, numpy_spacing = preprocess.load_itk_image
 
 
 # ─────────────────────────────────────────────
@@ -190,28 +206,33 @@ def evaluate(model, loader, device):
 # ─────────────────────────────────────────────
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--val_fold', type=int, default=0)
+    args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
+    print(f"Args : {args.val_fold}")
 
-    # ── Dataset & 70/30 split ───────────────────────────────────────
-    dataset    = NodulePatchDataset(CONFIG["num_samples"], CONFIG["patch_size"])
-    total      = len(dataset)
-    train_size = int(total * CONFIG["train_ratio"])
-    test_size  = total - train_size
+    data_dir = "data"
+    candidates = "candidates.csv"
+    annotations = "annotations.csv"
+    patch_size = 64
 
-    train_ds, test_ds = random_split(
-        dataset,
-        [train_size, test_size],
-        generator=torch.Generator().manual_seed(42)   # reproducible split
-    )
-    print(f"Dataset split — Train: {train_size}  |  Test: {test_size}  (70/30)")
+    #10 fold cross validation
+    train_ds   = NodulePatchDataset(patch_size, data_dir, candidates, annotations,
+    val_fold=args.val_fold,
+    is_val=False)
+    test_ds    = NodulePatchDataset(patch_size, data_dir, candidates, annotations,
+    val_fold=args.val_fold,
+    is_val=True)
+
 
     train_loader = DataLoader(
         train_ds,
-        batch_size  = CONFIG["batch_size"],
-        shuffle     = True,
-        num_workers = CONFIG["num_workers"],
-        pin_memory  = device.type == "cuda",
+        batch_size=CONFIG["batch_size"],
+        shuffle=False,
+        num_workers=CONFIG["num_workers"],
+        pin_memory=device.type == "cuda",
     )
     test_loader = DataLoader(
         test_ds,
