@@ -1,8 +1,5 @@
 import torch
 import torch.nn as nn
-import matplotlib.pyplot as plt
-import numpy as np
-
 
 # ─────────────────────────────────────────────
 # BUILDING BLOCKS (3D)
@@ -27,7 +24,6 @@ class ConvBlock3D(nn.Module):
     def forward(self, x):
         return self.block(x)
 
-
 class DownBlock3D(nn.Module):
     """
     Encoder step: ConvBlock3D followed by MaxPool3d
@@ -43,7 +39,6 @@ class DownBlock3D(nn.Module):
         x = self.pool(skip)
         return x, skip        # return compressed x and the skip
 
-
 class UpBlock3D(nn.Module):
     """
     Decoder step: ConvTranspose3d → concat skip → ConvBlock3D
@@ -58,7 +53,6 @@ class UpBlock3D(nn.Module):
         x = self.upsample(x)                    # double spatial size in all 3D
         x = torch.cat([x, skip], dim=1)         # concatenate skip connection
         return self.conv(x)
-
 
 # ─────────────────────────────────────────────
 # FULL 3D U-NET WITH BRANCHING CLASSIFIER
@@ -127,7 +121,9 @@ class UNet3DWithClassifier(nn.Module):
         # ── Segmentation output ───────────────────────────────────────
         # 1x1x1 conv to get per-voxel prediction
         self.seg_head = nn.Conv3d(features, out_channels, kernel_size=1)
-        self.seg_activation = nn.Sigmoid()  # per-voxel probability map
+        # NOTE: no sigmoid here — model returns raw logits for seg_head.
+        # DiceLoss applies sigmoid internally. dice_score metric applies it too.
+        # This avoids double-sigmoid which distorts gradients.
 
     def forward(self, x):
         # ── Encoder — compress and save skip connections
@@ -149,7 +145,7 @@ class UNet3DWithClassifier(nn.Module):
         x = self.dec1(x, skip1)   # (batch,  16, 64, 64, 64)
 
         # ── Segmentation output
-        seg_map = self.seg_activation(self.seg_head(x))  # (batch, 1, 64, 64, 64)
+        seg_map = self.seg_head(x)  # (batch, 1, 64, 64, 64) — raw logits
 
         return seg_map, cancer_probability
 
@@ -163,17 +159,21 @@ class DiceLoss(nn.Module):
     Dice loss for 3D segmentation.
     Handles class imbalance well — critical for nodules
     which are tiny compared to the full patch volume.
+
+    Expects RAW LOGITS from the model (no sigmoid applied beforehand).
+    Applies sigmoid internally so the loss sees clean probabilities
+    without any double-sigmoid distortion on gradients.
     """
     def __init__(self, smooth=1e-6):
         super().__init__()
         self.smooth = smooth
 
     def forward(self, pred, target):
+        pred = torch.sigmoid(pred)   # logits → probabilities, applied once here
         pred = pred.view(-1)
         target = target.view(-1)
         intersection = (pred * target).sum()
         return 1 - (2 * intersection + self.smooth) / (pred.sum() + target.sum() + self.smooth)
-
 
 class CombinedLoss(nn.Module):
     """
