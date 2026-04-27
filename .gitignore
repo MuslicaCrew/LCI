@@ -4,3 +4,9 @@ archive/*
 plotting-of-seg-map.ipynb
 best_model.pth
 __pycache__/
+data
+seg-lungs
+precomputed
+annotations.csv
+candidates.csv
+candidates_V2

@@ -319,7 +319,7 @@ def check_disk_budget(n_candidates: int, patch_size: int, max_gb: float) -> None
 
     print(f"Disk estimate (uncompressed upper bound) : {gb_uncompressed:.1f} GB")
     print(f"Disk budget (--max_gb)                   : {max_gb:.1f} GB")
-    print( "Note: compressed output will be much smaller (57x observed on this dataset)")
+    print( "Note: compressed output will be much smaller")
 
     if gb_uncompressed > max_gb:
         raise SystemExit(
@@ -530,8 +530,8 @@ def main() -> None:
     total = len(index_df)
     n_pos = int((index_df['label'] == 1).sum())
     n_neg = int((index_df['label'] == 0).sum())
-
-    estimated_gb = measure_compressed_size(index_df, sample_size=200)
+    sample_size = 2000
+    estimated_gb = measure_compressed_size(index_df, sample_size=sample_size)
 
     print("\n" + "=" * 60)
     print("PRECOMPUTATION COMPLETE")
@@ -542,15 +542,12 @@ def main() -> None:
     print(f"  Patch dir           : {patch_dir}")
     print(f"  Seg mask dir        : {seg_dir}")
     print(f"  Index               : {index_path}")
-    print(f"  Est. disk usage     : ~{estimated_gb:.2f} GB  (compressed, sampled from 200 files)")
+    print(f"  Est. disk usage     : ~{estimated_gb:.2f} GB  (compressed, sampled from {sample_size} files)")
     print("=" * 60)
     print("\nTo load in your Dataset:")
     print("  patch    = np.load(row.patch_path)['patch']")
     print("  seg_mask = np.load(row.seg_mask_path)['seg_mask']")
     print("=" * 60)
-    print("\nTo load in your Dataset:")
-    print("  patch    = np.load(row.patch_path)['patch']")
-    print("  seg_mask = np.load(row.seg_mask_path)['seg_mask']")
 
 
 if __name__ == "__main__":
