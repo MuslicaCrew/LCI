@@ -209,16 +209,26 @@ def process_scan(
 
             # World → voxel. load_itk_image reverses axes to (z,y,x),
             # so voxel_zyx is already in the correct numpy indexing order.
-            world_xyz = np.array([cand['coordX'], cand['coordY'], cand['coordZ']])
-            voxel_zyx = world_to_voxel_coordinates(world_xyz, origin, spacing)
+            world_zyx = np.array([cand['coordZ'], cand['coordY'], cand['coordX']])
+            voxel_zyx = world_to_voxel_coordinates(world_zyx, origin, spacing)
 
             # ── 5a. Extract CT patch ──────────────────────────────────
             patch = extract_patch(ct_array, voxel_zyx, patch_size, pad_value=0.0)
 
+            # ── 5a-check. Skip degenerate patches ────────────────────
+            # A candidate at or outside the volume boundary produces an
+            # all-zero (or near-zero) patch that carries no useful signal.
+            # Positives are never skipped regardless — a missing positive
+            # is worse than a slightly padded one.
+            nonzero_fraction = float(np.count_nonzero(patch)) / patch.size
+            if label == 0 and nonzero_fraction < 0.10:
+                print(f"Found a patch with {nonzero_fraction:.2f}% nonzero fraction")
+                continue  # skip — do not save, do not add to index
+
             # ── 5b. Determine nodule diameter ─────────────────────────
             if label == 1 and ann_coords is not None:
                 # Match to the spatially closest annotation in world space
-                dists = np.linalg.norm(ann_coords - world_xyz, axis=1)
+                dists = np.linalg.norm(ann_coords - world_zyx, axis=1)
                 closest_idx = int(np.argmin(dists))
                 diameter_mm = float(ann_diameters[closest_idx])
             else:
@@ -234,7 +244,7 @@ def process_scan(
             patch_path    = os.path.join(patch_dir, f"{stem}.npz")
             seg_mask_path = os.path.join(seg_dir,   f"{stem}.npz")
 
-            np.savez_compressed(patch_path,    patch=patch)
+            np.savez_compressed(patch_path,    patch=patch.astype(np.float16))
             np.savez_compressed(seg_mask_path, seg_mask=seg_mask)
 
             rows.append({
