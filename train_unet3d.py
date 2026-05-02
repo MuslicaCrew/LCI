@@ -189,8 +189,8 @@ class NodulePatchDataset(Dataset):
 
 CONFIG = {
     "patch_size"          : 64,
-    "batch_size"          : 4,         # keep low for 3D — increase if VRAM allows
-    "num_epochs"          : 125,
+    "batch_size"          : 16,         # keep low for 3D — increase if VRAM allows
+    "num_epochs"          : 4,
     "learning_rate"       : 1e-4,
     "features"            : 32,        # 32 for >=12 GB VRAM, 16 for 8 GB
     "seg_weight"          : 0.7,
@@ -424,7 +424,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
 
-    index_csv = "precomputed/index.csv"
+    index_csv = "~/precomputed/index.csv"
     test_loader = None
     train_loader = None
 
@@ -467,6 +467,7 @@ def main():
     # ── Model, loss, optimiser ──────────────────────────────────────
     print(f"Setting scheduler, otimizer and criterion")
     model = UNet3DWithClassifier(features=CONFIG["features"]).to(device)
+    model = torch.compile(model, mode='reduce-overhead')
     criterion = CombinedLoss(CONFIG["seg_weight"], CONFIG["cls_weight"])
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     # GradScaler is a no-op when enabled=False (CPU), so safe to always create

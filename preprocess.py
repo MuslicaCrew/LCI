@@ -397,7 +397,7 @@ def main() -> None:
     parser.add_argument("--mask_dir",    default="seg-lungs",       help="Dir with lung segmentation .mhd files (optional)")
     parser.add_argument("--candidates",  default="candidates.csv",  help="Path to candidates.csv")
     parser.add_argument("--annotations", default="annotations.csv", help="Path to annotations.csv")
-    parser.add_argument("--out_dir",     default="precomputed",     help="Output root directory")
+    parser.add_argument("--out_dir",     default="~/precomputed",   help="Output root directory")
     parser.add_argument("--patch_size",  type=int,   default=64,    help="Cubic patch side length in voxels")
     parser.add_argument("--workers",     type=int,   default=4,     help="Parallel worker processes (1 = serial/debug mode)")
     parser.add_argument("--neg_ratio",   type=int,   default=100,   help="Negatives per positive (e.g. 100 → 1:100 balance)")
@@ -406,9 +406,9 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Resolve output directories ────────────────────────────────────────
-    patch_dir  = os.path.join(args.out_dir, "patches")
-    seg_dir    = os.path.join(args.out_dir, "seg_masks")
-    index_path = os.path.join(args.out_dir, "index.csv")
+    patch_dir  = os.path.join(os.path.expanduser(args.out_dir), "patches")
+    seg_dir    = os.path.join(os.path.expanduser(args.out_dir), "seg_masks")
+    index_path = os.path.join(os.path.expanduser(args.out_dir), "index.csv")
     os.makedirs(patch_dir, exist_ok=True)
     os.makedirs(seg_dir,   exist_ok=True)
 

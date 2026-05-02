@@ -108,7 +108,7 @@ class UNet3DWithClassifier(nn.Module):
             nn.ReLU(inplace=True),
             nn.Dropout(0.4),
             nn.Linear(128, 1),
-            nn.Sigmoid()                    # 0.0 = no nodule, 1.0 = nodule
+            #nn.Sigmoid()                    # 0.0 = no nodule, 1.0 = nodule
         )
 
         # ── Decoder (expanding path) ─────────────────────────────────
@@ -188,7 +188,7 @@ class CombinedLoss(nn.Module):
     def __init__(self, seg_weight=0.7, cls_weight=0.3):
         super().__init__()
         self.dice = DiceLoss()
-        self.bce = nn.BCELoss()
+        self.bce = nn.BCEWithLogitsLoss()
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
 
