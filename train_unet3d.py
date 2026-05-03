@@ -12,6 +12,11 @@ from sklearn.metrics import (
 import torch.nn.functional as Functional
 from unet3d_classifier import UNet3DWithClassifier, CombinedLoss
 
+import warnings
+warnings.filterwarnings("ignore", message="Can't initialize amdsmi")
+torch.set_float32_matmul_precision('high')  # ← add here
+
+
 # ─────────────────────────────────────────────
 # AUGMENTATION
 # ─────────────────────────────────────────────
@@ -189,8 +194,8 @@ class NodulePatchDataset(Dataset):
 
 CONFIG = {
     "patch_size"          : 64,
-    "batch_size"          : 16,         # keep low for 3D — increase if VRAM allows
-    "num_epochs"          : 4,
+    "batch_size"          : 32,         # keep low for 3D — increase if VRAM allows
+    "num_epochs"          : 150,
     "learning_rate"       : 1e-4,
     "features"            : 32,        # 32 for >=12 GB VRAM, 16 for 8 GB
     "seg_weight"          : 0.7,
@@ -201,6 +206,9 @@ CONFIG = {
                                        # 3 → 1 pos : 3 neg per batch (25% positive)
                                        # lower = more positive signal, higher = more variety
                                        # val loader is NEVER rebalanced — keeps true prevalence
+    "early_stop_patience" : 20,    # epochs without improvement before stopping
+    "early_stop_min_delta": 1e-4,  # minimum improvement to count as "better"
+    "early_stop_min_epoch": 20,    # don't stop before this epoch regardless
 }
 
 
@@ -228,14 +236,16 @@ def binary_accuracy(pred, target, threshold=0.5):
 # ─────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
+    print(f"We are training: {train}")
     model.train() if train else model.eval()
 
     total_loss, total_dice, total_acc = 0.0, 0.0, 0.0
     is_cuda = device.type == "cuda"
+    n_batches = len(loader)
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for patches, seg_masks, cls_labels in loader:
+        for batch_idx, (patches, seg_masks, cls_labels) in enumerate(loader, 1):   # ← enumerate starting at 1
             patches = patches.to(device)
             seg_masks = seg_masks.to(device)
             cls_labels = cls_labels.to(device)
@@ -253,14 +263,18 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
             if train:
                 # scaler handles loss scaling to prevent fp16 underflow
                 scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)  # ← add this
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
 
             total_loss += loss.item()
-            # dice_score receives logits — applies sigmoid internally
-            total_dice += dice_score(seg_pred.detach(), seg_masks)
-            total_acc += binary_accuracy(cls_pred.detach(), cls_labels)
+            total_dice += dice_score(torch.sigmoid(seg_pred).detach(), seg_masks)
+            total_acc += binary_accuracy(torch.sigmoid(cls_pred).detach(), cls_labels)
+            print(f"  Batch [{batch_idx}/{n_batches}]  loss: {loss.item():.4f}", end="\r")  # ← print on same line
 
+
+    print()  # ← newline after the \r loop finishes
     n = len(loader)
     return total_loss / n, total_dice / n, total_acc / n
 
@@ -277,23 +291,26 @@ def evaluate(model, loader, device):
       • ROC-AUC
       • Confusion matrix plot
     """
+    print("Evaluating model...")
     model.eval()
-
+    n_batches = len(loader)
     all_cls_probs, all_cls_labels = [], []
     all_dice = []
-
     with torch.no_grad():
-        for patches, seg_masks, cls_labels in loader:
+        for batch_idx, (patches, seg_masks, cls_labels) in enumerate(loader, 1):
             patches    = patches.to(device)
             seg_masks  = seg_masks.to(device)
             cls_labels = cls_labels.to(device)
 
             seg_pred, cls_pred = model(patches)
 
-            all_dice.append(dice_score(seg_pred, seg_masks))
+            all_dice.append(dice_score(torch.sigmoid(seg_pred), seg_masks))
             all_cls_probs.append(cls_pred.cpu().numpy())
             all_cls_labels.append(cls_labels.cpu().numpy())
+            print(f"  Batch [{batch_idx}/{n_batches}]", end="\r")  # ← print on same line
 
+    print()  # ← newline after loop
+    print("Flatten")
     cls_probs  = np.concatenate(all_cls_probs).flatten()   # (N,)
     cls_labels = np.concatenate(all_cls_labels).flatten()  # (N,)
     cls_preds  = (cls_probs > 0.5).astype(int)
@@ -354,7 +371,7 @@ def make_weighted_sampler(dataset: NodulePatchDataset, pos_neg_ratio: int) -> We
     # one "epoch" still means one full pass over the negatives on average
     sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=len(dataset),
+        num_samples=n_pos * (1+pos_neg_ratio) * 6,
         replacement=True,
     )
 
@@ -443,6 +460,15 @@ def main():
         test_ds = NodulePatchDataset(index_csv, val_fold=args.val_fold, is_val=True)
         train_sampler = make_weighted_sampler(train_ds, CONFIG["pos_neg_train_ratio"])
 
+        # ── Stratified val subset ─────────────────────────────────────
+        val_index = test_ds.index
+        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~120 positives
+        neg_idx = val_index[val_index["label"] == 0].sample(
+            n=2000, random_state=42
+        ).index.tolist()  # 2000 random negatives
+        subset_idx = pos_idx + neg_idx
+
+
         train_loader = DataLoader(
             train_ds,
             batch_size=CONFIG["batch_size"],
@@ -451,9 +477,9 @@ def main():
             pin_memory=device.type == "cuda",
         )
         test_loader = DataLoader(
-            test_ds,
+            torch.utils.data.Subset(test_ds, subset_idx),  # ← wrap test_ds
             batch_size=CONFIG["batch_size"],
-            shuffle=False,  # val: natural prevalence, no rebalancing
+            shuffle=False,
             num_workers=CONFIG["num_workers"],
             pin_memory=device.type == "cuda",
         )
@@ -467,13 +493,14 @@ def main():
     # ── Model, loss, optimiser ──────────────────────────────────────
     print(f"Setting scheduler, otimizer and criterion")
     model = UNet3DWithClassifier(features=CONFIG["features"]).to(device)
-    model = torch.compile(model, mode='reduce-overhead')
+    #model = torch.compile(model, mode='reduce-overhead')
+    model = torch.compile(model, mode='default')
     criterion = CombinedLoss(CONFIG["seg_weight"], CONFIG["cls_weight"])
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     # GradScaler is a no-op when enabled=False (CPU), so safe to always create
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=15
+        optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-6
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -485,6 +512,8 @@ def main():
     best_val_loss = float("inf")
 
     for epoch in range(1, CONFIG["num_epochs"] + 1):
+        print(f"Epoch : {epoch}")
+    #for epoch in trange(1, CONFIG["num_epochs"] + 1, desc="Epochs", position=0):
         tr_loss, tr_dice, tr_acc = run_epoch(
             model, train_loader, criterion, optimizer, device, scaler, train=True
         )
@@ -493,10 +522,25 @@ def main():
             vl_loss, vl_dice, vl_acc = run_epoch(
                 model, test_loader, criterion, optimizer, device, scaler, train=False
             )
+            scheduler.step(vl_loss)
         else:
             vl_loss, vl_dice, vl_acc = 0.0, 0.0, 0.0
-        scheduler.step(vl_loss)
 
+        if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
+            if vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]:
+                best_val_dice = vl_dice
+                patience_counter = 0
+            # save best checkpoint here
+            else:
+                patience_counter += 1
+
+            if patience_counter >= CONFIG["early_stop_patience"]:
+               print(f"\nEarly stopping triggered at epoch {epoch}")
+               print(f"Best val Dice: {best_val_dice:.4f}")
+               break
+
+
+        print("Before history")
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(vl_loss)
         history["train_dice"].append(tr_dice)
@@ -512,13 +556,14 @@ def main():
         )
 
         # Save best model
-        if vl_loss < best_val_loss:
-            best_val_loss = vl_loss
+        if  test_loader is not None and vl_loss < best_val_loss:
+            best_val_dice = vl_dice
             torch.save(model.state_dict(), CONFIG["save_path"])
-            print(f"  ✓ Best model saved (val_loss: {best_val_loss:.4f})")
+            print(f"  ✓ Best model saved (vl_dice: {best_val_dice:.4f})")
 
+    print("Creating plots")
     # ── Learning curves ─────────────────────────────────────────────
-    epochs = range(1, CONFIG["num_epochs"] + 1)
+    epochs = range(1, len(history["train_loss"]) + 1)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
     axes[0].plot(epochs, history["train_loss"], label="Train")
@@ -538,8 +583,10 @@ def main():
     print("Learning curves saved → training_curves.png")
 
     # ── Load best weights and run full evaluation ───────────────────
-    model.load_state_dict(torch.load(CONFIG["save_path"], map_location=device))
-    evaluate(model, test_loader, device)
+    if test_loader is not None:
+        print("Loading best state...")
+        model.load_state_dict(torch.load(CONFIG["save_path"], map_location=device, weights_only=True))
+        evaluate(model, test_loader, device)
 
 
 if __name__ == "__main__":
