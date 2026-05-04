@@ -444,6 +444,7 @@ def main():
     index_csv = "~/precomputed/index.csv"
     test_loader = None
     train_loader = None
+    N_VAL_NEG = 4_000
 
     if args.final:
         train_ds = NodulePatchDataset(index_csv, val_fold=None, is_val=False, augment=True)
@@ -462,12 +463,12 @@ def main():
 
         # ── Stratified val subset ─────────────────────────────────────
         val_index = test_ds.index
-        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~120 positives
+        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~1200 positives
         neg_idx = val_index[val_index["label"] == 0].sample(
-            n=2000, random_state=42
-        ).index.tolist()  # 2000 random negatives
+            n=N_VAL_NEG
+        ).index.tolist()
         subset_idx = pos_idx + neg_idx
-
+        val_subset = torch.utils.data.Subset(test_ds, subset_idx)
 
         train_loader = DataLoader(
             train_ds,
@@ -477,7 +478,7 @@ def main():
             pin_memory=device.type == "cuda",
         )
         test_loader = DataLoader(
-            torch.utils.data.Subset(test_ds, subset_idx),  # ← wrap test_ds
+            val_subset,
             batch_size=CONFIG["batch_size"],
             shuffle=False,
             num_workers=CONFIG["num_workers"],
@@ -510,7 +511,6 @@ def main():
     history = {"train_loss": [], "val_loss": [], "train_dice": [],
                "val_dice": [], "train_acc": [], "val_acc": []}
     best_val_loss = float("inf")
-
     for epoch in range(1, CONFIG["num_epochs"] + 1):
         print(f"Epoch : {epoch}")
     #for epoch in trange(1, CONFIG["num_epochs"] + 1, desc="Epochs", position=0):
