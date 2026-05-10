@@ -445,6 +445,7 @@ def main():
     test_loader = None
     train_loader = None
     N_VAL_NEG = 4_000
+    patience_counter = 0
 
     if args.final:
         train_ds = NodulePatchDataset(index_csv, val_fold=None, is_val=False, augment=True)
@@ -464,23 +465,11 @@ def main():
         # ── Stratified val subset ─────────────────────────────────────
         val_index = test_ds.index
         pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~1200 positives
-        neg_idx = val_index[val_index["label"] == 0].sample(
-            n=N_VAL_NEG
-        ).index.tolist()
-        subset_idx = pos_idx + neg_idx
-        val_subset = torch.utils.data.Subset(test_ds, subset_idx)
 
         train_loader = DataLoader(
             train_ds,
             batch_size=CONFIG["batch_size"],
             sampler=train_sampler,  # sampler handles shuffling — do not set shuffle=True
-            num_workers=CONFIG["num_workers"],
-            pin_memory=device.type == "cuda",
-        )
-        test_loader = DataLoader(
-            val_subset,
-            batch_size=CONFIG["batch_size"],
-            shuffle=False,
             num_workers=CONFIG["num_workers"],
             pin_memory=device.type == "cuda",
         )
@@ -513,7 +502,22 @@ def main():
     best_val_loss = float("inf")
     for epoch in range(1, CONFIG["num_epochs"] + 1):
         print(f"Epoch : {epoch}")
-    #for epoch in trange(1, CONFIG["num_epochs"] + 1, desc="Epochs", position=0):
+        # ── Rebuild val loader with fresh negatives each epoch ────────────
+        if not args.final:  # ← guard
+            neg_idx = val_index[val_index["label"] == 0].sample(
+                n=N_VAL_NEG
+            ).index.tolist()
+            subset_idx = pos_idx + neg_idx
+            val_subset = torch.utils.data.Subset(test_ds, subset_idx)
+            test_loader = DataLoader(
+                val_subset,
+                batch_size=CONFIG["batch_size"],
+                shuffle=False,
+                num_workers=CONFIG["num_workers"],
+                pin_memory=device.type == "cuda",
+                persistent_workers=True,
+            )
+
         tr_loss, tr_dice, tr_acc = run_epoch(
             model, train_loader, criterion, optimizer, device, scaler, train=True
         )
@@ -529,7 +533,7 @@ def main():
         if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
             if vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]:
                 best_val_dice = vl_dice
-                patience_counter = 0
+
             # save best checkpoint here
             else:
                 patience_counter += 1
