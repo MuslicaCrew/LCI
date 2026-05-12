@@ -209,6 +209,10 @@ CONFIG = {
     "early_stop_patience" : 20,    # epochs without improvement before stopping
     "early_stop_min_delta": 1e-4,  # minimum improvement to count as "better"
     "early_stop_min_epoch": 20,    # don't stop before this epoch regardless
+    "warmup_epochs"       : 10,    # LR ramps from warmup_start_lr → learning_rate over this many epochs
+                                   # keeps early weight updates small while model weights are still random,
+                                   # which is the main cause of wild val Dice swings in early epochs
+    "warmup_start_lr"     : 1e-6,  # starting LR for warmup — near-zero updates on epoch 1
 }
 
 
@@ -217,12 +221,14 @@ CONFIG = {
 # ─────────────────────────────────────────────
 
 def dice_score(pred, target, threshold=0.5, smooth=1e-6):
-    """Compute mean Dice score over a batch (after sigmoid)."""
+    """Compute mean Dice score over a batch (after sigmoid), averaged per sample."""
     pred_bin = (pred > threshold).float()
-    pred_f   = pred_bin.view(-1)
-    tgt_f    = target.view(-1)
-    intersection = (pred_f * tgt_f).sum()
-    return ((2 * intersection + smooth) / (pred_f.sum() + tgt_f.sum() + smooth)).item()
+    # Flatten spatial dims only — keep batch dim (B, D*H*W)
+    pred_f = pred_bin.view(pred_bin.shape[0], -1)
+    tgt_f = target.view(target.shape[0], -1)
+    intersection = (pred_f * tgt_f).sum(dim=1)
+    dice_per_sample = (2 * intersection + smooth) / (pred_f.sum(dim=1) + tgt_f.sum(dim=1) + smooth)
+    return dice_per_sample.mean().item()
 
 
 def binary_accuracy(pred, target, threshold=0.5):
@@ -305,7 +311,7 @@ def evaluate(model, loader, device):
             seg_pred, cls_pred = model(patches)
 
             all_dice.append(dice_score(torch.sigmoid(seg_pred), seg_masks))
-            all_cls_probs.append(cls_pred.cpu().numpy())
+            all_cls_probs.append(torch.sigmoid(cls_pred).cpu().numpy())
             all_cls_labels.append(cls_labels.cpu().numpy())
             print(f"  Batch [{batch_idx}/{n_batches}]", end="\r")  # ← print on same line
 
@@ -456,15 +462,38 @@ def main():
             sampler=train_sampler,  # sampler and shuffle are mutually exclusive
             num_workers=CONFIG["num_workers"],
             pin_memory=device.type == "cuda",
+            persistent_workers=True,
         )
     else:
         train_ds = NodulePatchDataset(index_csv, val_fold=args.val_fold, is_val=False, augment=True)
         test_ds = NodulePatchDataset(index_csv, val_fold=args.val_fold, is_val=True)
         train_sampler = make_weighted_sampler(train_ds, CONFIG["pos_neg_train_ratio"])
 
-        # ── Stratified val subset ─────────────────────────────────────
+        # ── Stratified val subset — frozen once before the training loop ──────
+        # Negatives are sampled ONCE here with a fixed seed so every epoch sees
+        # the identical val set. This makes val Dice a stable, comparable signal.
+        # Previously negatives were resampled each epoch, meaning swings in val
+        # Dice could simply reflect easier/harder negative draws, not model quality.
         val_index = test_ds.index
         pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~1200 positives
+        neg_idx = (
+            val_index[val_index["label"] == 0]
+            .sample(n=N_VAL_NEG, random_state=42)   # fixed seed → reproducible val set
+            .index.tolist()
+        )
+        frozen_val_subset = torch.utils.data.Subset(test_ds, pos_idx + neg_idx)
+        test_loader = DataLoader(
+            frozen_val_subset,
+            batch_size=CONFIG["batch_size"],
+            shuffle=False,
+            num_workers=CONFIG["num_workers"],
+            pin_memory=device.type == "cuda",
+            persistent_workers=True,   # workers persist — no rebuild cost each epoch
+        )
+        print(
+            f"Val set frozen: {len(pos_idx):,} pos + {len(neg_idx):,} neg "
+            f"= {len(frozen_val_subset):,} total (seed=42, never resampled)"
+        )
 
         train_loader = DataLoader(
             train_ds,
@@ -472,6 +501,7 @@ def main():
             sampler=train_sampler,  # sampler handles shuffling — do not set shuffle=True
             num_workers=CONFIG["num_workers"],
             pin_memory=device.type == "cuda",
+            persistent_workers=True,
         )
 
     #print(f"Saving pictures...")
@@ -489,8 +519,29 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     # GradScaler is a no-op when enabled=False (CPU), so safe to always create
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=15, min_lr=1e-6
+
+    # ── Two-phase LR schedule ─────────────────────────────────────────────────
+    # Phase 1 — Linear warmup (epochs 1 → warmup_epochs):
+    #   LR ramps from warmup_start_lr up to learning_rate over warmup_epochs epochs.
+    #   This prevents large gradient updates while weights are still near-random,
+    #   which was the root cause of the wild val Dice swings in early epochs.
+    #   LinearLR uses a multiplicative start_factor: LR = base_lr * start_factor
+    #   on epoch 1, then linearly increases to base_lr by the end of warmup.
+    #
+    # Phase 2 — ReduceLROnPlateau (epochs warmup_epochs+1 → end):
+    #   Standard adaptive decay: halves LR when val Dice stops improving for
+    #   `patience` epochs. mode="max" because higher Dice = better.
+    #
+    # SequentialLR switches automatically from phase 1 → phase 2 at the
+    # milestone epoch. After the milestone, only plateau_scheduler is active.
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=CONFIG["warmup_start_lr"] / CONFIG["learning_rate"],  # e.g. 1e-6/1e-4 = 0.01
+        end_factor=1.0,           # ramp up to full learning_rate
+        total_iters=CONFIG["warmup_epochs"],
+    )
+    plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=15, min_lr=1e-6,  # mode=max: higher vl_dice = better
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -499,24 +550,17 @@ def main():
     # ── Training loop ───────────────────────────────────────────────
     history = {"train_loss": [], "val_loss": [], "train_dice": [],
                "val_dice": [], "train_acc": [], "val_acc": []}
-    best_val_loss = float("inf")
+
+    # Single source of truth: vl_dice drives both checkpointing and early stopping.
+    # best_val_loss is intentionally removed — combined loss is dominated by BCE
+    # which barely moves, making it an unreliable checkpoint signal.
+    best_val_dice = 0.0
+    patience_counter = 0
+
     for epoch in range(1, CONFIG["num_epochs"] + 1):
         print(f"Epoch : {epoch}")
-        # ── Rebuild val loader with fresh negatives each epoch ────────────
-        if not args.final:  # ← guard
-            neg_idx = val_index[val_index["label"] == 0].sample(
-                n=N_VAL_NEG
-            ).index.tolist()
-            subset_idx = pos_idx + neg_idx
-            val_subset = torch.utils.data.Subset(test_ds, subset_idx)
-            test_loader = DataLoader(
-                val_subset,
-                batch_size=CONFIG["batch_size"],
-                shuffle=False,
-                num_workers=CONFIG["num_workers"],
-                pin_memory=device.type == "cuda",
-                persistent_workers=True,
-            )
+        # test_loader is built once before the loop (frozen val set).
+        # No per-epoch rebuild — val Dice is now a stable, epoch-comparable signal.
 
         tr_loss, tr_dice, tr_acc = run_epoch(
             model, train_loader, criterion, optimizer, device, scaler, train=True
@@ -526,25 +570,24 @@ def main():
             vl_loss, vl_dice, vl_acc = run_epoch(
                 model, test_loader, criterion, optimizer, device, scaler, train=False
             )
-            scheduler.step(vl_loss)
         else:
             vl_loss, vl_dice, vl_acc = 0.0, 0.0, 0.0
 
-        if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
-            if vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]:
-                best_val_dice = vl_dice
+        # ── Scheduler step ────────────────────────────────────────────────────
+        # During warmup, LinearLR steps every epoch with no metric needed.
+        # After warmup, ReduceLROnPlateau takes over and requires vl_dice.
+        # We track which phase we're in via epoch vs warmup_epochs.
+        if epoch <= CONFIG["warmup_epochs"]:
+            warmup_scheduler.step()   # LinearLR: no metric, just advance the ramp
+        else:
+            if test_loader is not None:
+                plateau_scheduler.step(vl_dice)   # ReduceLROnPlateau: needs the metric
+        print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}", end="")
+        if epoch <= CONFIG["warmup_epochs"]:
+            print(f"  [warmup {epoch}/{CONFIG['warmup_epochs']}]")
+        else:
+            print()
 
-            # save best checkpoint here
-            else:
-                patience_counter += 1
-
-            if patience_counter >= CONFIG["early_stop_patience"]:
-               print(f"\nEarly stopping triggered at epoch {epoch}")
-               print(f"Best val Dice: {best_val_dice:.4f}")
-               break
-
-
-        print("Before history")
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(vl_loss)
         history["train_dice"].append(tr_dice)
@@ -559,11 +602,25 @@ def main():
             f"Acc  → train: {tr_acc:.3f}  val: {vl_acc:.3f}"
         )
 
-        # Save best model
-        if  test_loader is not None and vl_loss < best_val_loss:
+        # ── Checkpoint: save whenever val Dice improves (no epoch gate) ──────
+        # Gating this on early_stop_min_epoch would risk missing a best checkpoint
+        # that occurs in early epochs (e.g. epoch 15 hit 0.969 in your first run).
+        if test_loader is not None and vl_dice > best_val_dice:
             best_val_dice = vl_dice
+            patience_counter = 0
             torch.save(model.state_dict(), CONFIG["save_path"])
             print(f"  ✓ Best model saved (vl_dice: {best_val_dice:.4f})")
+        else:
+            # Only count patience after min epoch — let model warm up first
+            if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
+                patience_counter += 1
+
+        # ── Early stopping ────────────────────────────────────────────────────
+        if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
+            if patience_counter >= CONFIG["early_stop_patience"]:
+                print(f"\nEarly stopping triggered at epoch {epoch}")
+                print(f"Best val Dice: {best_val_dice:.4f}")
+                break
 
     print("Creating plots")
     # ── Learning curves ─────────────────────────────────────────────
