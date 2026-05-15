@@ -213,6 +213,9 @@ CONFIG = {
                                    # keeps early weight updates small while model weights are still random,
                                    # which is the main cause of wild val Dice swings in early epochs
     "warmup_start_lr"     : 1e-6,  # starting LR for warmup — near-zero updates on epoch 1
+    "val_neg_multiplier"  : 10,    # N_VAL_NEG = n_pos_in_fold * val_neg_multiplier
+                                   # ~120 pos in fold 0 → 1,200 negatives (1:10 ratio)
+                                   # more realistic than hardcoded 4,000 and scales correctly across folds
 }
 
 
@@ -242,7 +245,11 @@ def binary_accuracy(pred, target, threshold=0.5):
 # ─────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
-    print(f"We are training: {train}")
+    if train:
+        print(f"Training...")
+    else:
+        print(f"Evaluating...")
+
     model.train() if train else model.eval()
 
     total_loss, total_dice, total_acc = 0.0, 0.0, 0.0
@@ -377,7 +384,7 @@ def make_weighted_sampler(dataset: NodulePatchDataset, pos_neg_ratio: int) -> We
     # one "epoch" still means one full pass over the negatives on average
     sampler = WeightedRandomSampler(
         weights=sample_weights,
-        num_samples=n_pos * (1+pos_neg_ratio) * 6,
+        num_samples=n_pos * (1+pos_neg_ratio) * 2,
         replacement=True,
     )
 
@@ -443,6 +450,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--val_fold', type=int, default=0)
     parser.add_argument('--final', action='store_true')
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume from")
     args = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
@@ -450,7 +458,6 @@ def main():
     index_csv = "~/precomputed/index.csv"
     test_loader = None
     train_loader = None
-    N_VAL_NEG = 4_000
     patience_counter = 0
 
     if args.final:
@@ -475,7 +482,8 @@ def main():
         # Previously negatives were resampled each epoch, meaning swings in val
         # Dice could simply reflect easier/harder negative draws, not model quality.
         val_index = test_ds.index
-        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all ~1200 positives
+        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all positives in this fold (~120, i.e. 1/10 of the ~1200 total)
+        N_VAL_NEG = len(pos_idx) * CONFIG["val_neg_multiplier"]  # scales with fold size — no magic numbers
         neg_idx = (
             val_index[val_index["label"] == 0]
             .sample(n=N_VAL_NEG, random_state=42)   # fixed seed → reproducible val set
@@ -541,7 +549,7 @@ def main():
         total_iters=CONFIG["warmup_epochs"],
     )
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=15, min_lr=1e-6,  # mode=max: higher vl_dice = better
+        optimizer, mode="max", factor=0.5, patience=10, min_lr=1e-6,  # mode=max: higher vl_dice = better
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -556,8 +564,21 @@ def main():
     # which barely moves, making it an unreliable checkpoint signal.
     best_val_dice = 0.0
     patience_counter = 0
+    start_epoch = 1
 
-    for epoch in range(1, CONFIG["num_epochs"] + 1):
+    if args.resume:
+        print(f"Resuming from checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        warmup_scheduler.load_state_dict(ckpt["scheduler_warmup"])
+        plateau_scheduler.load_state_dict(ckpt["scheduler_plateau"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch = ckpt["epoch"] + 1
+        best_val_dice = ckpt["best_val_dice"]
+        print(f"  → Resumed at epoch {start_epoch}, best_val_dice: {best_val_dice:.4f}")
+
+    for epoch in range(start_epoch, CONFIG["num_epochs"] + 1):
         print(f"Epoch : {epoch}")
         # test_loader is built once before the loop (frozen val set).
         # No per-epoch rebuild — val Dice is now a stable, epoch-comparable signal.
@@ -608,7 +629,15 @@ def main():
         if test_loader is not None and vl_dice > best_val_dice:
             best_val_dice = vl_dice
             patience_counter = 0
-            torch.save(model.state_dict(), CONFIG["save_path"])
+            torch.save({
+                "epoch": epoch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler_warmup": warmup_scheduler.state_dict(),
+                "scheduler_plateau": plateau_scheduler.state_dict(),
+                "scaler": scaler.state_dict(),
+                "best_val_dice": best_val_dice,
+            }, CONFIG["save_path"])
             print(f"  ✓ Best model saved (vl_dice: {best_val_dice:.4f})")
         else:
             # Only count patience after min epoch — let model warm up first
