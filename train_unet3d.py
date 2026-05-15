@@ -672,12 +672,6 @@ def main():
     plt.savefig("training_curves.png", dpi=150)
     print("Learning curves saved → training_curves.png")
 
-    # ── Load best weights and run full evaluation ───────────────────
-    if test_loader is not None:
-        print("Loading best state...")
-        model.load_state_dict(torch.load(CONFIG["save_path"], map_location=device, weights_only=True))
-        evaluate(model, test_loader, device)
-
 
 if __name__ == "__main__":
     main()
