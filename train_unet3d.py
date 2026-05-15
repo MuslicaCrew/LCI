@@ -395,53 +395,6 @@ def make_weighted_sampler(dataset: NodulePatchDataset, pos_neg_ratio: int) -> We
         f"(each positive drawn ~{n_neg / pos_neg_ratio / max(n_pos, 1):.0f}× per epoch)"
     )
     return sampler
-
-def save_patch_previews(dataset: NodulePatchDataset, n: int = 10, out_dir: str = "patch_previews") -> None:
-    """
-    Save n central slices of patches and their seg masks as PNG images.
-
-    Samples the first n items from the dataset directly (no sampler) so
-    you get a deterministic, fast sanity check before training starts.
-    Saves side-by-side: patch slice on the left, mask slice on the right.
-
-    For each sample i:
-        patch_previews/sample_{i:02d}_pos.png  (label=1)
-        patch_previews/sample_{i:02d}_neg.png  (label=0)
-
-    Output: n PNG files, one per sample, named by index and label.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-
-    for i in range(min(n, len(dataset))):
-        patch_t, mask_t, label = dataset[i]
-
-        # Central slice along the z (depth) axis
-        z_mid = patch_t.shape[1] // 2
-        patch_slice = patch_t[0, z_mid].numpy()   # (H, W) float32 in [0, 1]
-        mask_slice  = mask_t[0,  z_mid].numpy()   # (H, W) float32 binary
-
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
-        fig.suptitle(f"Sample {i:02d} — label={'NODULE' if label == 1 else 'negative'}", fontsize=12)
-
-        axes[0].imshow(patch_slice, cmap="gray", vmin=0, vmax=1)
-        axes[0].set_title("CT patch (central slice)")
-        axes[0].axis("off")
-
-        axes[1].imshow(patch_slice, cmap="gray", vmin=0, vmax=1)   # CT as background
-        axes[1].imshow(mask_slice,  cmap="Reds", alpha=0.5, vmin=0, vmax=1)  # mask overlay
-        axes[1].set_title("Seg mask overlay")
-        axes[1].axis("off")
-
-        plt.tight_layout()
-
-        label_str = "pos" if label == 1 else "neg"
-        save_path = os.path.join(out_dir, f"sample_{i:02d}_{label_str}.png")
-        plt.savefig(save_path, dpi=120, bbox_inches="tight")
-        plt.close(fig)
-
-    print(f"Saved {min(n, len(dataset))} patch previews → {out_dir}/")
-
-
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
@@ -512,11 +465,6 @@ def main():
             persistent_workers=True,
         )
 
-    #print(f"Saving pictures...")
-    # ── Patch preview — sanity check before training ──────────────────
-    #save_patch_previews(train_ds, n=100, out_dir="patch_previews")
-    #print(f"Done saving")
-    #exit()
 
     # ── Model, loss, optimiser ──────────────────────────────────────
     print(f"Setting scheduler, otimizer and criterion")
