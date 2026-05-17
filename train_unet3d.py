@@ -225,13 +225,22 @@ CONFIG = {
 
 def dice_score(pred, target, threshold=0.5, smooth=1e-6):
     """Compute mean Dice score over a batch (after sigmoid), averaged per sample."""
-    pred_bin = (pred > threshold).float()
     # Flatten spatial dims only — keep batch dim (B, D*H*W)
+    pred_bin = (pred > threshold).float()
     pred_f = pred_bin.view(pred_bin.shape[0], -1)
     tgt_f = target.view(target.shape[0], -1)
+
     intersection = (pred_f * tgt_f).sum(dim=1)
-    dice_per_sample = (2 * intersection + smooth) / (pred_f.sum(dim=1) + tgt_f.sum(dim=1) + smooth)
-    return dice_per_sample.mean().item()
+    denom = pred_f.sum(dim=1) + tgt_f.sum(dim=1)
+    dice_per_sample = (2 * intersection + smooth) / (denom + smooth)
+
+    # Only average over samples that actually contain foreground.
+    # Empty-mask patches carry no segmentation signal and should not
+    # be scored as "perfect" just because the model also predicted nothing.
+    has_fg = tgt_f.sum(dim=1) > 0
+    if has_fg.any():
+        return dice_per_sample[has_fg].mean().item()
+    return float("nan")  # caller skips NaN batches
 
 
 def binary_accuracy(pred, target, threshold=0.5):
