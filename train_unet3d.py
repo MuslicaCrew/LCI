@@ -262,6 +262,7 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
     model.train() if train else model.eval()
 
     total_loss, total_dice, total_acc = 0.0, 0.0, 0.0
+    dice_values = []  # collect per-batch Dice; some entries may be nan
     is_cuda = device.type == "cuda"
     n_batches = len(loader)
 
@@ -291,14 +292,22 @@ def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
                 scaler.update()
 
             total_loss += loss.item()
-            total_dice += dice_score(torch.sigmoid(seg_pred).detach(), seg_masks)
-            total_acc += binary_accuracy(torch.sigmoid(cls_pred).detach(), cls_labels)
+            dice_values.append(dice_score(torch.sigmoid(seg_pred).detach(), seg_masks))
+            total_acc += binary_accuracy(torch.sigmoid(cls_pred).squeeze(1).detach(), cls_labels)
             print(f"  Batch [{batch_idx}/{n_batches}]  loss: {loss.item():.4f}", end="\r")  # ← print on same line
 
 
     print()  # ← newline after the \r loop finishes
     n = len(loader)
-    return total_loss / n, total_dice / n, total_acc / n
+
+    # np.nanmean ignores nan entries (batches with no foreground patches).
+    # If EVERY batch was nan (no positives all epoch — shouldn't happen with
+    # your sampler, but guard anyway), fall back to 0.0 instead of nan.
+    mean_dice = float(np.nanmean(dice_values)) if len(dice_values) > 0 else 0.0
+    if np.isnan(mean_dice):
+        mean_dice = 0.0
+
+    return total_loss / n, mean_dice, total_acc / n
 
 
 # ─────────────────────────────────────────────
@@ -583,7 +592,7 @@ def main():
         # ── Checkpoint: save whenever val Dice improves (no epoch gate) ──────
         # Gating this on early_stop_min_epoch would risk missing a best checkpoint
         # that occurs in early epochs (e.g. epoch 15 hit 0.969 in your first run).
-        if test_loader is not None and vl_dice > best_val_dice:
+        if test_loader is not None and vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]:
             best_val_dice = vl_dice
             patience_counter = 0
             torch.save({
