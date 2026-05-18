@@ -21,6 +21,40 @@ import numpy as np
 import torch
 
 from unet3d_classifier import UNet3DWithClassifier
+import warnings
+warnings.filterwarnings("ignore", message="Can't initialize amdsmi")
+
+def load_trained_weights(
+    model: torch.nn.Module,
+    weights_path: str,
+    device: torch.device,
+) -> None:
+    """
+    Load weights from a training checkpoint into an uncompiled model.
+
+    best_model.pth is the full training dict (epoch/optimizer/scheduler/
+    scaler/best_val_dice + weights under "model"), not a bare state_dict.
+    Training also wrapped the model in torch.compile, which prefixes every
+    key with "_orig_mod." — strip it since this model is uncompiled.
+    """
+    ckpt = torch.load(weights_path, map_location=device, weights_only=True)
+
+    # Unwrap: full checkpoint dict vs. bare state_dict
+    if isinstance(ckpt, dict) and "model" in ckpt:
+        epoch = ckpt.get("epoch", "?")
+        best = ckpt.get("best_val_dice", float("nan"))
+        print(f"  Checkpoint: epoch {epoch}, best_val_dice={best:.4f}")
+        state_dict = ckpt["model"]
+    else:
+        state_dict = ckpt
+
+    # Strip torch.compile's "_orig_mod." prefix (leading occurrence only)
+    state_dict = {
+        k.replace("_orig_mod.", "", 1): v for k, v in state_dict.items()
+    }
+
+    model.load_state_dict(state_dict)
+
 
 
 # ─────────────────────────────────────────────
@@ -32,7 +66,7 @@ def export(
     output_path:  str,
     features:     int,
     patch_size:   int,
-    opset:        int,
+    #opset:        int,
     device:       torch.device,
 ) -> None:
     """
@@ -51,7 +85,7 @@ def export(
     print(f"  Output    : {output_path}")
     print(f"  Features  : {features}")
     print(f"  Patch size: {patch_size}³")
-    print(f"  Opset     : {opset}")
+    #print(f"  Opset     : {opset}")
     print(f"  Device    : {device}")
 
     # ── Load model — raw nn.Module, no torch.compile ──────────────────
@@ -62,9 +96,8 @@ def export(
         features=features,
     ).to(device)
 
-    state = torch.load(weights_path, map_location=device, weights_only=True)
-    model.load_state_dict(state)
-    model.eval()  # critical — disables dropout and sets BN to inference mode
+    load_trained_weights(model, weights_path, device)
+    model.eval()
     print("  Weights loaded ✓")
 
     # ── Dummy input — shape must match training exactly ───────────────
@@ -79,7 +112,7 @@ def export(
             dummy_input,
             output_path,
             export_params=True,          # embed weights into the .onnx file
-            opset_version=opset,         # opset 17 has solid 3D conv support
+            #opset_version=opset,         # opset 17 has solid 3D conv support
             do_constant_folding=True,    # fold constant subgraphs → smaller file
             input_names=["ct_patch"],
             output_names=["seg_map", "cls_prob"],
@@ -143,8 +176,10 @@ def verify(
     dummy_np = np.random.randn(1, 1, patch_size, patch_size, patch_size).astype(np.float32)
 
     # PyTorch reference output
-    model = UNet3DWithClassifier(features=features).to(device)
-    model.load_state_dict(torch.load(weights_path, map_location=device, weights_only=True))
+    model = UNet3DWithClassifier(
+        in_channels=1, out_channels=1, features=features
+    ).to(device)
+    load_trained_weights(model, weights_path, device)
     model.eval()
     with torch.no_grad():
         pt_seg, pt_cls = model(torch.from_numpy(dummy_np).to(device))
@@ -225,11 +260,14 @@ def main() -> None:
     parser.add_argument("--out",        type=str,  default="unet3d.onnx",     help="Output .onnx file path")
     parser.add_argument("--features",   type=int,  default=32,                help="Model features (must match training)")
     parser.add_argument("--patch-size", type=int,  default=64,                help="Patch size (must match training)")
-    parser.add_argument("--opset",      type=int,  default=17,                help="ONNX opset version")
+    #parser.add_argument("--opset",      type=int,  default=17,                help="ONNX opset version")
     parser.add_argument("--no-verify",  action="store_true",                  help="Skip numerical verification step")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # CPU-only: ROCm GPU tracing captures aten.miopen_batch_norm,
+    # which the ONNX exporter cannot translate. The exported model
+    # is device-agnostic regardless of export device.
+    device = torch.device("cpu")
     print(f"Device : {device}")
 
     # ── Export ────────────────────────────────────────────────────────
@@ -238,7 +276,6 @@ def main() -> None:
         output_path=args.out,
         features=args.features,
         patch_size=args.patch_size,
-        opset=args.opset,
         device=device,
     )
 
