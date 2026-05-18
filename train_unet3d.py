@@ -407,11 +407,13 @@ def make_weighted_sampler(dataset: NodulePatchDataset, pos_neg_ratio: int) -> We
         replacement=True,
     )
 
-    pos_frac = 1.0 / (1.0 + pos_neg_ratio)
+    pos_draws_per_epoch = n_pos * (1 + pos_neg_ratio) * 3 * pos_frac
+    actual_draws_per_pos = pos_draws_per_epoch / n_pos  # = (1 + pos_neg_ratio) * 3 * pos_frac
+
     print(
         f"WeightedRandomSampler : {n_pos:,} pos / {n_neg:,} neg  →  "
-        f"~{pos_frac*100:.0f}% positive per batch  "
-        f"(each positive drawn ~{n_neg / pos_neg_ratio / max(n_pos, 1):.0f}× per epoch)"
+        f"~{pos_frac * 100:.0f}% positive per batch  "
+        f"(each positive drawn ~{actual_draws_per_pos:.1f}× per epoch)"
     )
     return sampler
 # ─────────────────────────────────────────────
@@ -490,7 +492,7 @@ def main():
     model = UNet3DWithClassifier(features=CONFIG["features"]).to(device)
     #model = torch.compile(model, mode='reduce-overhead')
     model = torch.compile(model, mode='default')
-    criterion = CombinedLoss(CONFIG["seg_weight"], CONFIG["cls_weight"])
+    criterion = CombinedLoss(CONFIG["seg_weight"], CONFIG["cls_weight"]).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     # GradScaler is a no-op when enabled=False (CPU), so safe to always create
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
