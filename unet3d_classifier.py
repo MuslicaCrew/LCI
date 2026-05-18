@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 
 # ─────────────────────────────────────────────
 # BUILDING BLOCKS (3D)
@@ -204,7 +205,7 @@ class CombinedLoss(nn.Module):
 
     def forward(self, seg_pred, seg_target, cls_pred, cls_target):
         seg_loss = self.dice(seg_pred, seg_target)
-        cls_loss = F.binary_cross_entropy_with_logits(
+        cls_loss = functional.binary_cross_entropy_with_logits(
             cls_pred, cls_target, pos_weight=self.pos_weight
         )
         return self.seg_weight * seg_loss + self.cls_weight * cls_loss

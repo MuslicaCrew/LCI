@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import (
     roc_auc_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
 )
-import torch.nn.functional as Functional
+import torch.nn.functional as functional
 from unet3d_classifier import UNet3DWithClassifier, CombinedLoss
 
 import warnings
@@ -103,13 +103,13 @@ class Augment3D:
         patch_b = patch.unsqueeze(0)
         mask_b  = mask.unsqueeze(0)
 
-        grid = Functional.affine_grid(theta, patch_b.shape, align_corners=False)
+        grid = functional.affine_grid(theta, patch_b.shape, align_corners=False)
 
         # bilinear for the patch — preserves smooth intensity values
-        patch_b = Functional.grid_sample(patch_b, grid, mode="bilinear",
+        patch_b = functional.grid_sample(patch_b, grid, mode="bilinear",
                                 padding_mode="zeros", align_corners=False)
         # nearest for the mask — keeps values binary, no interpolation blur
-        mask_b  = Functional.grid_sample(mask_b, grid, mode="nearest",
+        mask_b  = functional.grid_sample(mask_b, grid, mode="nearest",
                                 padding_mode="zeros", align_corners=False)
 
         patch = patch_b.squeeze(0)
@@ -398,6 +398,7 @@ def make_weighted_sampler(dataset: NodulePatchDataset, pos_neg_ratio: int) -> We
     weight_neg = 1.0 / pos_neg_ratio  # negatives drawn pos_neg_ratio× less often
 
     sample_weights = np.where(labels == 1, weight_pos, weight_neg).tolist()
+    pos_frac = 1.0 / (1.0 + pos_neg_ratio)  # moved up
 
     # num_samples controls epoch length — keep it equal to dataset size so
     # one "epoch" still means one full pass over the negatives on average
