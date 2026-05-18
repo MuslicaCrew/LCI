@@ -168,12 +168,22 @@ class DiceLoss(nn.Module):
         super().__init__()
         self.smooth = smooth
 
-    def forward(self, pred, target):
-        pred = torch.sigmoid(pred)   # logits → probabilities, applied once here
-        pred = pred.view(-1)
-        target = target.view(-1)
-        intersection = (pred * target).sum()
-        return 1 - (2 * intersection + self.smooth) / (pred.sum() + target.sum() + self.smooth)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.sigmoid(pred)
+        pred = pred.view(pred.shape[0], -1)
+        target = target.view(target.shape[0], -1)
+
+        intersection = (pred * target).sum(dim=1)
+        denominator = pred.sum(dim=1) + target.sum(dim=1)
+        dice_per_sample = (2 * intersection + self.smooth) / (denominator + self.smooth)
+        loss_per_sample = 1 - dice_per_sample
+
+        # only supervise the seg head where a mask actually exists
+        has_mask = target.sum(dim=1) > 0  # (B,) bool
+        if has_mask.any():
+            return loss_per_sample[has_mask].mean()
+        else:
+            return torch.tensor(0.0, device=pred.device, requires_grad=False)
 
 class CombinedLoss(nn.Module):
     """
@@ -185,10 +195,10 @@ class CombinedLoss(nn.Module):
     Higher seg_weight = prioritise localisation accuracy
     Higher cls_weight = prioritise detection accuracy
     """
-    def __init__(self, seg_weight=0.7, cls_weight=0.3):
+    def __init__(self, seg_weight=0.8, cls_weight=0.2):
         super().__init__()
         self.dice = DiceLoss()
-        self.bce = nn.BCEWithLogitsLoss()
+        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3.0]))
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
 
