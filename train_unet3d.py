@@ -3,6 +3,7 @@ import os
 
 import pandas as pd
 import torch
+from rich import print
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import numpy as np
 import matplotlib.pyplot as plt
@@ -515,7 +516,7 @@ def main():
         total_iters=CONFIG["warmup_epochs"],
     )
     plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=10, min_lr=1e-6,  # mode=max: higher vl_dice = better
+        optimizer, mode="max", factor=0.5, patience=5, min_lr=1e-6,  # mode=max: higher vl_dice = better
     )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -608,6 +609,7 @@ def main():
         else:
             # Only count patience after min epoch — let model warm up first
             if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
+                print(f"Patience counter: {patience_counter}")
                 patience_counter += 1
 
         # ── Early stopping ────────────────────────────────────────────────────
