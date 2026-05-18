@@ -198,13 +198,15 @@ class CombinedLoss(nn.Module):
     def __init__(self, seg_weight=0.8, cls_weight=0.2):
         super().__init__()
         self.dice = DiceLoss()
-        self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([3.0]))
+        self.register_buffer('pos_weight', torch.tensor([3.0]))
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
 
     def forward(self, seg_pred, seg_target, cls_pred, cls_target):
         seg_loss = self.dice(seg_pred, seg_target)
-        cls_loss = self.bce(cls_pred, cls_target)
+        cls_loss = F.binary_cross_entropy_with_logits(
+            cls_pred, cls_target, pos_weight=self.pos_weight
+        )
         return self.seg_weight * seg_loss + self.cls_weight * cls_loss
 
 
