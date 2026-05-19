@@ -186,6 +186,42 @@ class DiceLoss(nn.Module):
         else:
             return torch.tensor(0.0, device=pred.device, requires_grad=False)
 
+
+class TverskyLoss(nn.Module):
+    """
+      Tversky loss for 3D segmentation — a generalisation of Dice.
+
+      alpha weights false positives, beta weights false negatives.
+      With alpha < beta, missing a nodule voxel costs more than a
+      false alarm, which is the right tradeoff for nodule detection.
+      alpha=beta=0.5 is exactly Dice.
+
+      Expects RAW LOGITS (sigmoid applied internally, once).
+      """
+    def __init__(self, alpha: float = 0.3, beta: float = 0.7, smooth: float = 1e-6):
+        super().__init__()
+        self.alpha = alpha  # FP weight
+        self.beta = beta    # FN weight — keep higher to penalise missed nodules
+        self.smooth = smooth
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.sigmoid(pred)
+        pred   = pred.view(pred.shape[0], -1)
+        target = target.view(target.shape[0], -1)
+
+        tp = (pred * target).sum(dim=1)
+        fp = (pred * (1 - target)).sum(dim=1)
+        fn = ((1 - pred) * target).sum(dim=1)
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+        loss_per_sample = 1 - tversky
+
+        has_mask = target.sum(dim=1) > 0
+        if has_mask.any():
+            return loss_per_sample[has_mask].mean()
+        else:
+            return torch.tensor(0.0, device=pred.device, requires_grad=False)
+
 class CombinedLoss(nn.Module):
     """
     Multi-task loss combining:
@@ -198,13 +234,13 @@ class CombinedLoss(nn.Module):
     """
     def __init__(self, seg_weight=0.8, cls_weight=0.2):
         super().__init__()
-        self.dice = DiceLoss()
+        self.seg = TverskyLoss(alpha=0.3, beta=0.7)  # replaces DiceLoss
         self.register_buffer('pos_weight', torch.tensor([3.0]))
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
 
     def forward(self, seg_pred, seg_target, cls_pred, cls_target):
-        seg_loss = self.dice(seg_pred, seg_target)
+        seg_loss = self.seg(seg_pred, seg_target)
         cls_loss = functional.binary_cross_entropy_with_logits(
             cls_pred, cls_target, pos_weight=self.pos_weight
         )
