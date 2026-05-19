@@ -347,7 +347,7 @@ def evaluate(model, loader, device):
     cls_labels = np.concatenate(all_cls_labels).flatten()  # (N,)
     cls_preds  = (cls_probs > 0.5).astype(int)
 
-    mean_dice = np.mean(all_dice)
+    mean_dice = np.nanmean(all_dice)
     auc       = roc_auc_score(cls_labels, cls_probs)
 
     print("\n" + "=" * 50)
@@ -457,14 +457,22 @@ def main():
         # Previously negatives were resampled each epoch, meaning swings in val
         # Dice could simply reflect easier/harder negative draws, not model quality.
         val_index = test_ds.index
-        pos_idx = val_index[val_index["label"] == 1].index.tolist()  # all positives in this fold (~120, i.e. 1/10 of the ~1200 total)
-        N_VAL_NEG = len(pos_idx) * CONFIG["val_neg_multiplier"]  # scales with fold size — no magic numbers
+        pos_idx = val_index[val_index["label"] == 1].index.tolist()
+        N_VAL_NEG = len(pos_idx) * CONFIG["val_neg_multiplier"]
         neg_idx = (
             val_index[val_index["label"] == 0]
-            .sample(n=N_VAL_NEG, random_state=42)   # fixed seed → reproducible val set
+            .sample(n=N_VAL_NEG, random_state=42)
             .index.tolist()
         )
-        frozen_val_subset = torch.utils.data.Subset(test_ds, pos_idx + neg_idx)
+
+        # Interleave pos and neg so positives are distributed across batches
+        # instead of clustered in the first ~4. One-time, fixed-seed shuffle —
+        # the val set stays frozen and identical across epochs and runs.
+        combined_idx = pos_idx + neg_idx
+        rng = np.random.default_rng(42)
+        rng.shuffle(combined_idx)  # in-place, deterministic
+
+        frozen_val_subset = torch.utils.data.Subset(test_ds, combined_idx)
         test_loader = DataLoader(
             frozen_val_subset,
             batch_size=CONFIG["batch_size"],
