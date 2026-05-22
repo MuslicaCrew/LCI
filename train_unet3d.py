@@ -201,6 +201,18 @@ CONFIG = {
     "features"            : 32,        # 32 for >=12 GB VRAM, 16 for 8 GB
     "seg_weight"          : 0.7,
     "cls_weight"          : 0.3,
+    # ── Focal Tversky (segmentation) ────────────────────────────────────
+    # alpha < beta penalises missed nodule voxels harder than false alarms.
+    # gamma > 1 focuses gradient on hard patches (paper recommends 1.33).
+    # Set gamma=1.0 to reduce exactly to plain Tversky.
+    "seg_focal_alpha"     : 0.3,
+    "seg_focal_beta"      : 0.7,
+    "seg_focal_gamma"     : 1.33,
+    # ── Focal Loss (classification) ─────────────────────────────────────
+    # alpha=0.25 + gamma=2.0 are the original paper defaults. Nudge alpha
+    # up toward 0.5 if positives appear under-fitted (low recall on val).
+    "cls_focal_alpha"     : 0.25,
+    "cls_focal_gamma"     : 2.0,
     "num_workers"         : 8,
     "save_path"           : "best_model.pth",
     "pos_neg_train_ratio" : 3,         # negatives per positive in each training batch
@@ -501,7 +513,15 @@ def main():
     model = UNet3DWithClassifier(features=CONFIG["features"]).to(device)
     #model = torch.compile(model, mode='reduce-overhead')
     model = torch.compile(model, mode='default')
-    criterion = CombinedLoss(CONFIG["seg_weight"], CONFIG["cls_weight"]).to(device)
+    criterion = CombinedLoss(
+        seg_weight=CONFIG["seg_weight"],
+        cls_weight=CONFIG["cls_weight"],
+        seg_alpha=CONFIG["seg_focal_alpha"],
+        seg_beta=CONFIG["seg_focal_beta"],
+        seg_gamma=CONFIG["seg_focal_gamma"],
+        cls_alpha=CONFIG["cls_focal_alpha"],
+        cls_gamma=CONFIG["cls_focal_gamma"],
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["learning_rate"])
     # GradScaler is a no-op when enabled=False (CPU), so safe to always create
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")

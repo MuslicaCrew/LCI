@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
+
 # ─────────────────────────────────────────────
 # BUILDING BLOCKS (3D)
 # ─────────────────────────────────────────────
@@ -222,28 +223,174 @@ class TverskyLoss(nn.Module):
         else:
             return torch.tensor(0.0, device=pred.device, requires_grad=False)
 
+
+class FocalTverskyLoss(nn.Module):
+    """
+    Focal Tversky loss for 3D segmentation (Abraham & Khan, 2019).
+
+    Builds on Tversky by raising the per-sample (1 - Tversky) to a power gamma:
+        FTL = (1 - Tversky) ** gamma
+
+    Intuition:
+      - gamma > 1  → focus on HARD samples (low Tversky). Easy samples (Tversky
+                     near 1) contribute almost nothing to the gradient, so the
+                     optimiser concentrates on the few patches the network is
+                     still mispredicting. Recommended for LUNA16: the tiny
+                     nodule voxels are exactly the hard cases that vanilla
+                     Tversky undertrains on.
+      - gamma == 1 → reduces exactly to Tversky loss.
+      - gamma < 1  → focuses on EASY samples (rarely useful).
+
+    alpha weights false positives, beta weights false negatives.
+    With alpha < beta, missing a nodule voxel costs more than a false alarm,
+    which is the right tradeoff for nodule detection. The canonical
+    recommendation from the paper is alpha=0.3, beta=0.7, gamma=0.75 OR 1.33;
+    we default to gamma=1.33 (the "harder-focus" variant) since LUNA16 is
+    dominated by easy empty/near-empty patches.
+
+    Expects RAW LOGITS (sigmoid applied internally, once). Computes the focal
+    exponentiation in float32 inside autocast to avoid fp16 underflow of
+    (1 - Tversky) when it's close to zero.
+    """
+    def __init__(
+        self,
+        alpha: float = 0.3,
+        beta:  float = 0.7,
+        gamma: float = 1.33,
+        smooth: float = 1e-6,
+    ):
+        super().__init__()
+        self.alpha  = alpha   # FP weight
+        self.beta   = beta    # FN weight
+        self.gamma  = gamma   # focal exponent
+        self.smooth = smooth
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred = torch.sigmoid(pred)
+        pred   = pred.view(pred.shape[0], -1)
+        target = target.view(target.shape[0], -1)
+
+        tp = (pred * target).sum(dim=1)
+        fp = (pred * (1 - target)).sum(dim=1)
+        fn = ((1 - pred) * target).sum(dim=1)
+
+        tversky = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
+
+        # Force fp32 for the pow — small (1-tversky) values can underflow in fp16.
+        # Clamp away from 0 so log/grad of pow remain finite even at "perfect" samples.
+        one_minus_tv = (1.0 - tversky).float().clamp(min=self.smooth)
+        loss_per_sample = one_minus_tv.pow(self.gamma)
+
+        has_mask = target.sum(dim=1) > 0
+        if has_mask.any():
+            return loss_per_sample[has_mask].mean()
+        else:
+            return torch.tensor(0.0, device=pred.device, requires_grad=False)
+
+
+class FocalLoss(nn.Module):
+    """
+    Binary focal loss for classification (Lin et al., 2017, "Focal Loss for
+    Dense Object Detection").
+
+    Formula (on logits z, target y in {0,1}):
+        p   = sigmoid(z)
+        p_t = p   if y=1   else  1-p
+        alpha_t = alpha if y=1 else 1-alpha
+        FL = -alpha_t * (1 - p_t)**gamma * log(p_t)
+
+    Intuition:
+      - The (1 - p_t)**gamma factor down-weights easy examples where p_t is
+        close to 1. Hard examples (p_t small) keep their full BCE gradient.
+        With gamma=2 (paper default), an easy example with p_t=0.9 contributes
+        ~100x less than a hard example with p_t=0.5.
+      - alpha balances the two classes. With alpha=0.25, positives get
+        weight 0.25 and negatives 0.75 — counter-intuitive, but the paper
+        showed this is what works best in tandem with gamma, because gamma
+        already handles most of the imbalance via easy-negative suppression.
+        For LUNA16 (positives still rare even after WeightedRandomSampler),
+        alpha=0.25 is a safe default; nudge up to ~0.5 if positives appear
+        under-fitted.
+
+    Numerically stable: computed entirely from logits via the BCE-with-logits
+    identity, never explicitly calling sigmoid. AMP-safe.
+
+    Expects:
+        logits: (N,) raw scores from the classifier head
+        target: (N,) float in {0.0, 1.0}
+    """
+    def __init__(
+        self,
+        alpha: float = 0.25,
+        gamma: float = 2.0,
+        reduction: str = "mean",
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        assert reduction in ("mean", "sum", "none")
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        # Per-element BCE without reduction — this is -log(p_t) per sample.
+        ce = functional.binary_cross_entropy_with_logits(
+            logits, target, reduction="none"
+        )
+
+        # p_t = exp(-ce). When target=1, ce = -log(p) → exp(-ce) = p.
+        # When target=0, ce = -log(1-p) → exp(-ce) = 1-p.  Either way it's p_t.
+        # Cast to fp32 because exp() and pow() can underflow under autocast(fp16).
+        p_t = torch.exp(-ce.float())
+
+        # alpha_t: alpha for positives, (1-alpha) for negatives.
+        alpha_t = torch.where(target > 0.5, self.alpha, 1.0 - self.alpha)
+
+        focal_term = (1.0 - p_t).pow(self.gamma)
+        loss = alpha_t * focal_term * ce
+
+        if self.reduction == "mean":
+            return loss.mean()
+        if self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class CombinedLoss(nn.Module):
     """
     Multi-task loss combining:
-      - Dice loss   for 3D segmentation (where is the nodule?)
-      - BCE loss    for classification  (is there a nodule?)
+      - Focal Tversky loss for 3D segmentation (where is the nodule?)
+      - Focal loss         for classification  (is there a nodule?)
+
+    Focal variants replace the previous Tversky + BCE pair to give more
+    gradient weight to the hard, rare cases that dominate LUNA16:
+      - hard-to-segment nodule voxels (Focal Tversky, gamma > 1)
+      - hard-to-classify near-miss patches (Focal Loss, gamma=2)
 
     seg_weight + cls_weight should sum to 1.0
     Higher seg_weight = prioritise localisation accuracy
     Higher cls_weight = prioritise detection accuracy
     """
-    def __init__(self, seg_weight=0.8, cls_weight=0.2):
+    def __init__(
+        self,
+        seg_weight: float = 0.8,
+        cls_weight: float = 0.2,
+        # ── segmentation (Focal Tversky) hyperparameters ──
+        seg_alpha: float = 0.3,
+        seg_beta:  float = 0.7,
+        seg_gamma: float = 1.33,
+        # ── classification (Focal Loss) hyperparameters ──
+        cls_alpha: float = 0.25,
+        cls_gamma: float = 2.0,
+    ):
         super().__init__()
-        self.seg = TverskyLoss(alpha=0.3, beta=0.7)  # replaces DiceLoss
-        self.register_buffer('pos_weight', torch.tensor([3.0]))
+        self.seg = FocalTverskyLoss(alpha=seg_alpha, beta=seg_beta, gamma=seg_gamma)
+        self.cls = FocalLoss(alpha=cls_alpha, gamma=cls_gamma, reduction="mean")
         self.seg_weight = seg_weight
         self.cls_weight = cls_weight
 
     def forward(self, seg_pred, seg_target, cls_pred, cls_target):
         seg_loss = self.seg(seg_pred, seg_target)
-        cls_loss = functional.binary_cross_entropy_with_logits(
-            cls_pred, cls_target, pos_weight=self.pos_weight
-        )
+        cls_loss = self.cls(cls_pred, cls_target)
         return self.seg_weight * seg_loss + self.cls_weight * cls_loss
 
 
