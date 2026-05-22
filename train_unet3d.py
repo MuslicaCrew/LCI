@@ -671,6 +671,30 @@ def main():
     plt.savefig("training_curves.png", dpi=150)
     print("Learning curves saved → training_curves.png")
 
+    # ── Load best weights and run full evaluation ─────────────────────────
+    # Loads the BEST checkpoint (highest val Dice seen during training), not
+    # whatever was in memory when the loop exited — which may be several epochs
+    # past the best due to early-stopping patience.
+    #
+    # The checkpoint is now a dict (added when scheduler/scaler state was
+    # introduced), so we index ckpt["model"] instead of passing the whole
+    # thing to load_state_dict — the old `load_state_dict(torch.load(...))`
+    # call would fail with "Unexpected key(s): epoch, optimizer, ...".
+    #
+    # `model` is still the torch.compile-wrapped object here, and the
+    # checkpoint was saved from the same compiled model, so the
+    # `_orig_mod.` prefixed keys line up cleanly. weights_only=True is safe:
+    # only tensors and primitives are in the file.
+    #
+    # In --final mode there is no test_loader and no best checkpoint (saving
+    # is gated on test_loader is not None), so this whole block is skipped.
+    if test_loader is not None:
+        print("\nLoading best checkpoint for final evaluation...")
+        ckpt = torch.load(CONFIG["save_path"], map_location=device, weights_only=True)
+        model.load_state_dict(ckpt["model"])
+        print(f"  → Loaded epoch {ckpt['epoch']}, best_val_dice: {ckpt['best_val_dice']:.4f}")
+        evaluate(model, test_loader, device)
+
 
 if __name__ == "__main__":
     main()
