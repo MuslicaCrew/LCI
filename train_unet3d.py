@@ -1,5 +1,6 @@
 import argparse
 import os
+import time
 
 import pandas as pd
 import torch
@@ -262,16 +263,23 @@ def binary_accuracy(pred, target, threshold=0.5):
     return (pred_labels == target).float().mean().item()
 
 
+def format_duration(seconds: float) -> str:
+    """Format seconds as 'Hh Mm Ss' or 'Mm Ss' or 'Ss' depending on magnitude."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h {m:02d}m {s:02d}s"
+    if m > 0:
+        return f"{m}m {s:02d}s"
+    return f"{s}s"
+
+
 # ─────────────────────────────────────────────
 # ONE EPOCH
 # ─────────────────────────────────────────────
 
 def run_epoch(model, loader, criterion, optimizer, device, scaler, train=True):
-    if train:
-        print(f"Training...")
-    else:
-        print(f"Evaluating...")
-
     model.train() if train else model.eval()
 
     total_loss, total_dice, total_acc = 0.0, 0.0, 0.0
@@ -561,8 +569,10 @@ def main():
     # best_val_loss is intentionally removed — combined loss is dominated by BCE
     # which barely moves, making it an unreliable checkpoint signal.
     best_val_dice = 0.0
+    best_epoch = 0          # epoch number at which best_val_dice was hit (for "epochs since best")
     patience_counter = 0
     start_epoch = 1
+    early_stopped = False   # tracks whether we exited the loop via early stopping (for final summary)
 
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
@@ -574,39 +584,69 @@ def main():
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_val_dice = ckpt["best_val_dice"]
+        best_epoch = ckpt["epoch"]   # assume the saved epoch IS the best epoch (it always is — we only save on improvement)
         print(f"  → Resumed at epoch {start_epoch}, best_val_dice: {best_val_dice:.4f}")
 
-    for epoch in range(start_epoch, CONFIG["num_epochs"] + 1):
-        print(f"Epoch : {epoch}")
-        # test_loader is built once before the loop (frozen val set).
-        # No per-epoch rebuild — val Dice is now a stable, epoch-comparable signal.
+    # ── Wall-clock tracking ──────────────────────────────────────────────────
+    # training_start: anchors total elapsed and ETA calculations.
+    # epoch_times:    rolling window of recent epoch durations; ETA uses the
+    #                 mean of the last few rather than the very last one so
+    #                 a single slow epoch (disk hiccup, GC pause) doesn't
+    #                 throw the estimate.
+    training_start = time.perf_counter()
+    epoch_times: list[float] = []
+    ETA_WINDOW = 5  # average over the last N epochs
 
+    for epoch in range(start_epoch, CONFIG["num_epochs"] + 1):
+        # ── Reset CUDA peak memory so per-epoch reading reflects THIS epoch only ──
+        # Without the reset, max_memory_allocated() grows monotonically and tells
+        # us nothing useful after epoch 1. Resetting at the top makes the post-epoch
+        # print a genuine "how much VRAM did this epoch use" number, which is what
+        # catches memory leaks (peak should be flat — if it climbs, you have one).
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
+        # ── Epoch header — easy to grep for in long logs ──────────────────────
+        print(f"\n[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━ "
+              f"Epoch {epoch} / {CONFIG['num_epochs']} "
+              f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+
+        epoch_start = time.perf_counter()
+
+        # ── Train pass (timed) ────────────────────────────────────────────────
+        t0 = time.perf_counter()
         tr_loss, tr_dice, tr_acc = run_epoch(
             model, train_loader, criterion, optimizer, device, scaler, train=True
         )
+        train_duration = time.perf_counter() - t0
 
+        # ── Val pass (timed) ──────────────────────────────────────────────────
         if test_loader is not None:
+            t0 = time.perf_counter()
             vl_loss, vl_dice, vl_acc = run_epoch(
                 model, test_loader, criterion, optimizer, device, scaler, train=False
             )
+            val_duration = time.perf_counter() - t0
         else:
             vl_loss, vl_dice, vl_acc = 0.0, 0.0, 0.0
+            val_duration = 0.0
+
+        epoch_duration = time.perf_counter() - epoch_start
+        epoch_times.append(epoch_duration)
 
         # ── Scheduler step ────────────────────────────────────────────────────
         # During warmup, LinearLR steps every epoch with no metric needed.
         # After warmup, ReduceLROnPlateau takes over and requires vl_dice.
-        # We track which phase we're in via epoch vs warmup_epochs.
         if epoch <= CONFIG["warmup_epochs"]:
-            warmup_scheduler.step()   # LinearLR: no metric, just advance the ramp
+            warmup_scheduler.step()
+            lr_phase = f"warmup {epoch}/{CONFIG['warmup_epochs']}"
         else:
             if test_loader is not None:
-                plateau_scheduler.step(vl_dice)   # ReduceLROnPlateau: needs the metric
-        print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}", end="")
-        if epoch <= CONFIG["warmup_epochs"]:
-            print(f"  [warmup {epoch}/{CONFIG['warmup_epochs']}]")
-        else:
-            print()
+                plateau_scheduler.step(vl_dice)
+            lr_phase = "plateau"
+        current_lr = optimizer.param_groups[0]["lr"]
 
+        # ── Persist history ───────────────────────────────────────────────────
         history["train_loss"].append(tr_loss)
         history["val_loss"].append(vl_loss)
         history["train_dice"].append(tr_dice)
@@ -614,18 +654,49 @@ def main():
         history["train_acc"].append(tr_acc)
         history["val_acc"].append(vl_acc)
 
+        # ── ETA from rolling mean of recent epoch durations ───────────────────
+        recent = epoch_times[-ETA_WINDOW:]
+        mean_epoch_time = sum(recent) / len(recent)
+        epochs_remaining = CONFIG["num_epochs"] - epoch
+        eta_seconds = mean_epoch_time * epochs_remaining
+        total_elapsed = time.perf_counter() - training_start
+
+        # ── Per-epoch summary block ───────────────────────────────────────────
+        # One coherent block per epoch — easier to scan than the old
+        # interleaved scheduler/metric prints. Order: timing → metrics →
+        # checkpoint status → patience/best tracking.
         print(
-            f"Epoch [{epoch:02d}/{CONFIG['num_epochs']}]  "
-            f"Loss → train: {tr_loss:.4f}  val: {vl_loss:.4f}  |  "
-            f"Dice → train: {tr_dice:.4f}  val: {vl_dice:.4f}  |  "
-            f"Acc  → train: {tr_acc:.3f}  val: {vl_acc:.3f}"
+            f"  ⏱  {format_duration(epoch_duration)}  "
+            f"(train {format_duration(train_duration)}  /  val {format_duration(val_duration)})"
+            f"   |   LR: {current_lr:.2e}  [{lr_phase}]"
         )
+        print(
+            f"  Train  →  loss {tr_loss:.4f}   dice {tr_dice:.4f}   acc {tr_acc:.3f}"
+        )
+        print(
+            f"  Val    →  loss {vl_loss:.4f}   dice {vl_dice:.4f}   acc {vl_acc:.3f}"
+        )
+
+        # ── GPU memory (per-epoch peak, reset at top of loop) ─────────────────
+        if device.type == "cuda":
+            peak_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+            reserved_gb = torch.cuda.max_memory_reserved() / (1024 ** 3)
+            # allocated = tensors actually in use; reserved = held by the caching
+            # allocator (incl. free blocks). Reserved is what shows up in nvidia-smi.
+            print(f"  GPU    →  peak {peak_gb:.2f} GB allocated   /   {reserved_gb:.2f} GB reserved")
 
         # ── Checkpoint: save whenever val Dice improves (no epoch gate) ──────
         # Gating this on early_stop_min_epoch would risk missing a best checkpoint
         # that occurs in early epochs (e.g. epoch 15 hit 0.969 in your first run).
-        if test_loader is not None and vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]:
+        improved = (
+            test_loader is not None
+            and vl_dice > best_val_dice + CONFIG["early_stop_min_delta"]
+        )
+        if improved:
+            prev_best = best_val_dice
+            prev_best_epoch = best_epoch
             best_val_dice = vl_dice
+            best_epoch = epoch
             patience_counter = 0
             torch.save({
                 "epoch": epoch,
@@ -636,21 +707,69 @@ def main():
                 "scaler": scaler.state_dict(),
                 "best_val_dice": best_val_dice,
             }, CONFIG["save_path"])
-            print(f"  ✓ Best model saved (vl_dice: {best_val_dice:.4f})")
+            if prev_best_epoch == 0:
+                # first improvement — no previous best to compare against
+                print(f"  [green]✓ Best model saved   (val dice {best_val_dice:.4f})[/green]")
+            else:
+                delta = best_val_dice - prev_best
+                print(
+                    f"  [green]✓ Best model saved   "
+                    f"(val dice {best_val_dice:.4f}, prev {prev_best:.4f} at epoch {prev_best_epoch}, "
+                    f"Δ +{delta:.4f})[/green]"
+                )
         else:
-            # Only count patience after min epoch — let model warm up first
+            if test_loader is not None:
+                if best_epoch == 0:
+                    # haven't hit any best yet — nothing to report against
+                    print(f"  · No improvement   (val dice {vl_dice:.4f})")
+                else:
+                    print(
+                        f"  · No improvement   "
+                        f"(val dice {vl_dice:.4f}, best {best_val_dice:.4f} at epoch {best_epoch})"
+                    )
+            # Patience only counts after min epoch — let model warm up first
             if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
-                print(f"Patience counter: {patience_counter}")
                 patience_counter += 1
+
+        # ── Patience and timing footer ────────────────────────────────────────
+        if test_loader is not None:
+            epochs_since_best = (epoch - best_epoch) if best_epoch > 0 else epoch
+            patience_str = (
+                f"Patience: {patience_counter}/{CONFIG['early_stop_patience']}"
+                if epoch >= CONFIG["early_stop_min_epoch"]
+                else f"Patience: -- (counting starts at epoch {CONFIG['early_stop_min_epoch']})"
+            )
+            print(
+                f"  {patience_str}   |   "
+                f"epochs since best: {epochs_since_best}   |   "
+                f"total elapsed: {format_duration(total_elapsed)}   "
+                f"|   ETA: {format_duration(eta_seconds)}"
+            )
 
         # ── Early stopping ────────────────────────────────────────────────────
         if epoch >= CONFIG["early_stop_min_epoch"] and test_loader is not None:
             if patience_counter >= CONFIG["early_stop_patience"]:
-                print(f"\nEarly stopping triggered at epoch {epoch}")
-                print(f"Best val Dice: {best_val_dice:.4f}")
+                print(f"\n[yellow]Early stopping triggered at epoch {epoch}[/yellow]")
+                early_stopped = True
                 break
 
-    print("Creating plots")
+    # ── Training-complete summary block ───────────────────────────────────────
+    total_training_time = time.perf_counter() - training_start
+    epochs_run = len(history["train_loss"])
+    completion_tag = "early stop" if early_stopped else "natural completion"
+    print(f"\n[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━━━━━━ "
+          f"Training complete "
+          f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━[/bold cyan]")
+    print(f"  Total time: {format_duration(total_training_time)}   "
+          f"|   Epochs run: {epochs_run} / {CONFIG['num_epochs']} ({completion_tag})")
+    if best_epoch > 0:
+        print(f"  Best val dice: {best_val_dice:.4f} at epoch {best_epoch}")
+    elif test_loader is None:
+        print(f"  --final mode: no validation, no best checkpoint")
+    else:
+        print(f"  No improvement observed during training")
+
+    print("\nCreating plots")
     # ── Learning curves ─────────────────────────────────────────────
     epochs = range(1, len(history["train_loss"]) + 1)
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
